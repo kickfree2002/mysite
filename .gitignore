@@ -1,0 +1,21 @@
+# 環境変数 (認証情報を含むため絶対にコミットしない)
+.env
+
+# Pythonキャッシュ
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# 仮想環境
+.venv/
+venv/
+env/
+
+# ログファイル
+logs/*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
