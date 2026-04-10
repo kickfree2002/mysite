@@ -1,18 +1,21 @@
 """
-SBI証券 HyperSBI2 認証モジュール
+kabuステーション API 認証モジュール
 
-HyperSBI2はWebベースのセッション認証を使用します。
-このモジュールはログイン・セッション管理・トークンリフレッシュを担当します。
+kabuステーションのローカルREST APIからトークンを取得・管理します。
+HyperSBI2と異なり、Webスクレイピング不要のシンプルなトークン認証です。
+
+APIドキュメント:
+    POST http://localhost:18080/kabusapi/token
+    Body: {"APIPassword": "<パスワード>"}
+    Response: {"Token": "<トークン文字列>"}
 """
 
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
-from urllib.parse import urlencode
 
 import requests
-from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
@@ -21,289 +24,161 @@ load_dotenv()
 
 
 @dataclass
-class SessionInfo:
-    """セッション情報を保持するデータクラス"""
-    session_id: str = ""
-    login_time: float = 0.0
-    last_refresh: float = 0.0
-    is_authenticated: bool = False
-    username: str = ""
-    # HyperSBI2のセッションCookieを保持
-    cookies: dict = field(default_factory=dict)
+class TokenInfo:
+    """APIトークン情報"""
+    token: str = ""
+    issued_at: float = 0.0
+    # kabuステーションのトークンは当日中有効だが、念のため1時間でリフレッシュ
+    ttl_seconds: int = 3600
 
-    def is_expired(self, timeout_seconds: int = 1800) -> bool:
-        """セッションが期限切れかどうかを確認"""
-        if not self.is_authenticated:
+    def is_expired(self) -> bool:
+        """トークンが期限切れかどうか"""
+        if not self.token:
             return True
-        return (time.time() - self.last_refresh) > timeout_seconds
+        return (time.time() - self.issued_at) >= self.ttl_seconds
 
-    def age_seconds(self) -> float:
-        """ログインからの経過秒数"""
-        return time.time() - self.login_time if self.login_time else 0.0
+    def remaining_seconds(self) -> float:
+        """残り有効時間(秒)"""
+        return max(0.0, self.ttl_seconds - (time.time() - self.issued_at))
+
+    @property
+    def headers(self) -> dict:
+        """APIリクエスト用ヘッダー"""
+        return {"X-API-KEY": self.token, "Content-Type": "application/json"}
 
 
-class AuthenticationError(Exception):
+class KabuAuthError(Exception):
     """認証エラー"""
     pass
 
 
-class SessionExpiredError(Exception):
-    """セッション期限切れエラー"""
-    pass
-
-
-class SBIAuthClient:
+class KabuAuthClient:
     """
-    SBI証券 HyperSBI2 認証クライアント
+    kabuステーション APIトークン管理クライアント
 
     使用例:
-        client = SBIAuthClient()
-        client.login()
-        session = client.get_session()
-        # ... API呼び出し ...
-        client.logout()
+        client = KabuAuthClient()
+        token_info = client.get_token()
+        headers = token_info.headers
+        # → {"X-API-KEY": "xxxx", "Content-Type": "application/json"}
+
+    コンテキストマネージャとしても使用可能:
+        with KabuAuthClient() as auth:
+            headers = auth.token_info.headers
     """
 
-    LOGIN_URL = "https://site3.sbisec.co.jp/ETGate/"
-    LOGIN_POST_URL = "https://site3.sbisec.co.jp/ETGate/"
-    KEEP_ALIVE_URL = "https://site3.sbisec.co.jp/ETGate/?_ControlID=WPLEThmR001Control&_PageID=WPLEThmR001Ath20&_ActionID=DefaultAID&_SeqNo=1"
+    TOKEN_ENDPOINT = "/kabusapi/token"
 
     def __init__(
         self,
-        username: Optional[str] = None,
         password: Optional[str] = None,
-        session_timeout: int = None,
+        base_url: Optional[str] = None,
+        token_ttl: int = 3600,
     ):
-        self.username = username or os.getenv("SBI_USERNAME", "")
-        self.password = password or os.getenv("SBI_PASSWORD", "")
-        self.session_timeout = session_timeout or int(os.getenv("SESSION_TIMEOUT", "1800"))
+        """
+        Args:
+            password: APIパスワード (省略時は環境変数 KABU_API_PASSWORD を使用)
+            base_url: APIベースURL (省略時は KABU_BASE_URL または http://localhost:18080)
+            token_ttl: トークンの有効期間(秒)
+        """
+        self.password = password or os.getenv("KABU_API_PASSWORD", "")
+        self.base_url = (base_url or os.getenv("KABU_BASE_URL", "http://localhost:18080")).rstrip("/")
+        self.token_ttl = token_ttl
 
-        if not self.username or not self.password:
-            raise ValueError("SBI_USERNAME と SBI_PASSWORD を設定してください")
+        if not self.password:
+            raise KabuAuthError(
+                "APIパスワードが設定されていません。\n"
+                ".env に KABU_API_PASSWORD を設定してください。"
+            )
 
+        self._token_info = TokenInfo(ttl_seconds=token_ttl)
         self._session = requests.Session()
-        self._session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "ja,en-US;q=0.7,en;q=0.3",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-        })
-
-        self._session_info = SessionInfo(username=self.username)
+        self._session.headers.update({"Content-Type": "application/json"})
 
     @retry(
         stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type(requests.exceptions.RequestException),
+        wait=wait_exponential(multiplier=1, min=1, max=5),
+        retry=retry_if_exception_type(requests.exceptions.ConnectionError),
         reraise=True,
     )
-    def login(self) -> SessionInfo:
+    def fetch_token(self) -> TokenInfo:
         """
-        SBI証券にログインしてセッションを確立します。
+        kabuステーションからトークンを新規取得します。
 
         Returns:
-            SessionInfo: 確立されたセッション情報
+            TokenInfo: 取得したトークン情報
 
         Raises:
-            AuthenticationError: 認証失敗時
+            KabuAuthError: 認証失敗時
+            requests.exceptions.ConnectionError: kabuステーション未起動時
         """
-        logger.info(f"SBI証券にログイン中... (ユーザー: {self.username})")
+        url = f"{self.base_url}{self.TOKEN_ENDPOINT}"
+        logger.debug(f"トークン取得中... ({url})")
 
         try:
-            # Step 1: ログインページを取得してCSRFトークン等を取得
-            resp = self._session.get(self.LOGIN_URL, timeout=15)
-            resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, "lxml")
-
-            # ログインフォームのhiddenフィールドを収集
-            login_data = self._extract_form_data(soup)
-
-            # 認証情報をセット
-            login_data.update({
-                "user_id": self.username,
-                "user_password": self.password,
-                "ACT_login": "ログイン",
-            })
-
-            # Step 2: ログインPOST
             resp = self._session.post(
-                self.LOGIN_POST_URL,
-                data=login_data,
-                timeout=15,
-                allow_redirects=True,
+                url,
+                json={"APIPassword": self.password},
+                timeout=5,
             )
-            resp.raise_for_status()
-
-            # Step 3: ログイン成功確認
-            if not self._verify_login(resp):
-                raise AuthenticationError(
-                    "ログインに失敗しました。ユーザーID・パスワードを確認してください。"
-                )
-
-            # セッション情報を保存
-            now = time.time()
-            self._session_info = SessionInfo(
-                session_id=self._extract_session_id(),
-                login_time=now,
-                last_refresh=now,
-                is_authenticated=True,
-                username=self.username,
-                cookies=dict(self._session.cookies),
+        except requests.exceptions.ConnectionError:
+            raise requests.exceptions.ConnectionError(
+                f"kabuステーションに接続できません ({self.base_url})\n"
+                "kabuステーションが起動しているか確認してください。"
             )
 
-            logger.success(f"ログイン成功 (セッションID: {self._session_info.session_id[:8]}...)")
-            return self._session_info
+        if resp.status_code == 200:
+            token = resp.json().get("Token", "")
+            if not token:
+                raise KabuAuthError("レスポンスにTokenが含まれていません")
+            self._token_info = TokenInfo(
+                token=token,
+                issued_at=time.time(),
+                ttl_seconds=self.token_ttl,
+            )
+            logger.success(f"トークン取得完了 (有効期間: {self.token_ttl}秒)")
+            return self._token_info
 
-        except AuthenticationError:
-            raise
-        except requests.exceptions.RequestException as e:
-            logger.error(f"ネットワークエラー: {e}")
-            raise
-
-    def logout(self) -> None:
-        """ログアウトしてセッションを終了します"""
-        if not self._session_info.is_authenticated:
-            return
+        # エラーレスポンスの解析
         try:
-            logger.info("ログアウト中...")
-            self._session.get(
-                "https://site3.sbisec.co.jp/ETGate/?_ControlID=WPLEThmR001Control"
-                "&_PageID=WPLEThmR001Ath20&_ActionID=logout",
-                timeout=10,
-            )
-        except Exception as e:
-            logger.warning(f"ログアウトリクエストでエラー: {e}")
-        finally:
-            self._session_info.is_authenticated = False
-            self._session.cookies.clear()
-            logger.info("セッションをクリアしました")
+            err = resp.json()
+            code = err.get("Code", resp.status_code)
+            message = err.get("Message", "不明なエラー")
+        except Exception:
+            code, message = resp.status_code, resp.text
 
-    def refresh_session(self) -> bool:
+        raise KabuAuthError(f"トークン取得失敗 [Code={code}]: {message}")
+
+    def get_token(self, force_refresh: bool = False) -> TokenInfo:
         """
-        セッションをリフレッシュします（タイムアウト防止）
+        有効なトークンを返します。期限切れの場合は自動再取得します。
+
+        Args:
+            force_refresh: Trueの場合、期限に関わらず再取得
 
         Returns:
-            bool: リフレッシュ成功かどうか
+            TokenInfo: 有効なトークン情報
         """
-        if not self._session_info.is_authenticated:
-            logger.warning("未ログイン状態でのリフレッシュは無効です")
-            return False
-        try:
-            resp = self._session.get(self.KEEP_ALIVE_URL, timeout=10)
-            if resp.status_code == 200:
-                self._session_info.last_refresh = time.time()
-                logger.debug("セッションリフレッシュ完了")
-                return True
-            else:
-                logger.warning(f"セッションリフレッシュ失敗: HTTP {resp.status_code}")
-                return False
-        except Exception as e:
-            logger.warning(f"セッションリフレッシュエラー: {e}")
-            return False
+        if force_refresh or self._token_info.is_expired():
+            self.fetch_token()
+        return self._token_info
 
-    def ensure_authenticated(self) -> None:
-        """
-        認証済み状態を保証します。
-        セッション切れの場合は自動再ログインします。
+    @property
+    def token_info(self) -> TokenInfo:
+        """現在のトークン情報 (期限切れの場合は自動更新)"""
+        return self.get_token()
 
-        Raises:
-            AuthenticationError: 再ログインにも失敗した場合
-        """
-        if self._session_info.is_expired(self.session_timeout):
-            logger.info("セッション期限切れ。再ログインします...")
-            self.login()
-        elif (time.time() - self._session_info.last_refresh) > (self.session_timeout * 0.7):
-            # 期限の70%を超えたらリフレッシュ
-            self.refresh_session()
-
-    def get_session(self) -> requests.Session:
-        """認証済みrequests.Sessionオブジェクトを返します"""
-        self.ensure_authenticated()
-        return self._session
-
-    def get_session_info(self) -> SessionInfo:
-        """現在のセッション情報を返します"""
-        return self._session_info
-
-    def _extract_form_data(self, soup: BeautifulSoup) -> dict:
-        """ログインフォームのhiddenフィールドを抽出"""
-        data = {}
-        form = soup.find("form", {"name": "form1"}) or soup.find("form")
-        if form:
-            for inp in form.find_all("input", {"type": "hidden"}):
-                name = inp.get("name")
-                value = inp.get("value", "")
-                if name:
-                    data[name] = value
-        return data
-
-    def _verify_login(self, response: requests.Response) -> bool:
-        """レスポンスからログイン成功を確認"""
-        # ログイン失敗パターンの検出
-        failure_patterns = [
-            "ログインできませんでした",
-            "認証エラー",
-            "パスワードが正しくありません",
-            "ユーザーIDが見つかりません",
-            "login_error",
-        ]
-        body = response.text
-        for pattern in failure_patterns:
-            if pattern in body:
-                logger.debug(f"ログイン失敗パターン検出: '{pattern}'")
-                return False
-
-        # 成功パターンの確認
-        success_patterns = [
-            "ログアウト",
-            "お客様情報",
-            "口座情報",
-            "マイページ",
-        ]
-        for pattern in success_patterns:
-            if pattern in body:
-                return True
-
-        # どちらも検出できない場合はリダイレクト先で判断
-        return "sbisec.co.jp" in response.url and "login" not in response.url.lower()
-
-    def _extract_session_id(self) -> str:
-        """セッションCookieからセッションIDを抽出"""
-        for name in ["JSESSIONID", "SID", "SESSION", "session_id"]:
-            value = self._session.cookies.get(name)
-            if value:
-                return value
-        # Cookieがない場合はタイムスタンプベースのIDを生成
-        return f"local_{int(time.time())}"
+    def get_headers(self, force_refresh: bool = False) -> dict:
+        """APIリクエスト用ヘッダーを返します"""
+        return self.get_token(force_refresh).headers
 
     def __enter__(self):
-        self.login()
+        self.fetch_token()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.logout()
-
-
-def get_authenticated_session() -> tuple[SBIAuthClient, requests.Session]:
-    """
-    簡便な認証済みセッション取得関数
-
-    Returns:
-        (SBIAuthClient, requests.Session) のタプル
-
-    使用例:
-        client, session = get_authenticated_session()
-        resp = session.get("https://...")
-        client.logout()
-    """
-    client = SBIAuthClient()
-    client.login()
-    return client, client.get_session()
+        # kabuステーション APIにはログアウトエンドポイントなし
+        logger.debug("KabuAuthClient セッション終了")
 
 
 if __name__ == "__main__":
@@ -311,13 +186,16 @@ if __name__ == "__main__":
     logger.remove()
     logger.add(sys.stdout, format="{time:HH:mm:ss} | {level} | {message}", level="DEBUG")
 
-    logger.info("認証モジュール テスト")
+    logger.info("kabuステーション 認証モジュール テスト")
     try:
-        with SBIAuthClient() as client:
-            info = client.get_session_info()
-            logger.info(f"セッションID: {info.session_id}")
-            logger.info(f"認証状態: {info.is_authenticated}")
-            logger.info(f"ログイン経過時間: {info.age_seconds():.1f}秒")
-    except AuthenticationError as e:
+        client = KabuAuthClient()
+        info = client.fetch_token()
+        logger.info(f"Token    : {info.token[:8]}...")
+        logger.info(f"残り有効時間: {info.remaining_seconds():.0f}秒")
+        logger.info(f"Headers  : {list(info.headers.keys())}")
+    except KabuAuthError as e:
         logger.error(f"認証エラー: {e}")
+        sys.exit(1)
+    except requests.exceptions.ConnectionError as e:
+        logger.error(str(e))
         sys.exit(1)
