@@ -22,6 +22,7 @@ kabuステーション API 価格監視モジュール
 import argparse
 import json
 import os
+import requests
 import signal
 import sys
 import threading
@@ -146,20 +147,24 @@ class PriceMonitor:
     # ------------------------------------------------------------------
 
     def _start_websocket(self) -> None:
-        """WebSocketモードで監視を開始"""
+        """WebSocketモードで監視を開始。失敗時はpollingに自動フォールバック"""
         try:
             import websocket as ws_lib
         except ImportError:
-            logger.error(
-                "websocket-client がインストールされていません。\n"
-                "  pip install websocket-client\n"
-                "または --mode polling で起動してください。"
+            logger.warning(
+                "websocket-client がインストールされていません。pollingモードに切り替えます。\n"
+                "  pip install websocket-client"
             )
+            self._start_polling()
             return
 
         # 銘柄登録
         if not self._register_symbols():
-            logger.error("銘柄登録失敗。WebSocketモードを終了します。")
+            logger.warning(
+                "銘柄登録失敗 (模擬環境ではWebSocket Push非対応の場合があります)。\n"
+                "pollingモードに自動切り替えします。"
+            )
+            self._start_polling()
             return
 
         ws_url = f"ws://{self._auth.base_url.replace('http://', '')}/kabusapi/websocket"
@@ -227,21 +232,22 @@ class PriceMonitor:
                 for sym, exch in self.symbols
             ]
         }
+        logger.debug(f"銘柄登録リクエスト: {payload}")
         try:
-            resp = self._stock_client._session.put(
+            resp = requests.put(
                 url,
                 headers=self._auth.get_headers(),
                 json=payload,
                 timeout=5,
             )
             if resp.status_code == 200:
-                count = resp.json().get("RegistList", [])
-                logger.success(f"銘柄登録完了: {len(count)}銘柄")
+                regist_list = resp.json().get("RegistList", [])
+                logger.success(f"銘柄登録完了: {len(regist_list)}銘柄")
                 return True
-            logger.error(f"銘柄登録失敗: HTTP {resp.status_code} - {resp.text}")
+            logger.warning(f"銘柄登録失敗: HTTP {resp.status_code} - {resp.text}")
             return False
         except Exception as e:
-            logger.error(f"銘柄登録エラー: {e}")
+            logger.warning(f"銘柄登録エラー: {e}")
             return False
 
     # ------------------------------------------------------------------
