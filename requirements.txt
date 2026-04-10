@@ -1,22 +1,22 @@
 # kabuステーション API 自動売買システム 依存ライブラリ
 
 # HTTP クライアント
-requests==2.31.0
+requests>=2.28.0
 
 # WebSocket (リアルタイムPush受信)
-websocket-client==1.8.0
+websocket-client>=1.6.0
 
 # 環境変数管理
-python-dotenv==1.0.1
+python-dotenv>=1.0.0
 
-# データ操作
-pandas==2.2.2
+# データ操作 (Anacondaインストール済みの場合はスキップされます)
+pandas>=1.5.0
 
 # ログ管理
-loguru==0.7.2
+loguru>=0.6.0
 
 # リトライ処理
-tenacity==8.3.0
+tenacity>=8.0.0
 
 # 日時処理
-python-dateutil==2.9.0
+python-dateutil>=2.8.0
